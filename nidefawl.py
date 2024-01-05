@@ -1,10 +1,18 @@
+import copy
+import random
 import torch
 import numpy as np
 import folder_paths
 import comfy
+import comfy.sample
 import gc
+import json
 from PIL import Image, ImageFilter
 from nodes import MAX_RESOLUTION, VAELoader
+from comfy.k_diffusion.sampling import BrownianTreeNoiseSampler
+from comfy.samplers import Sampler, KSamplerX0Inpaint
+from comfy.k_diffusion import sampling as k_diffusion_sampling
+from numba import jit
 
 # Tensor to PIL
 def tensor2pil(image):
@@ -14,29 +22,38 @@ def tensor2pil(image):
 def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
 
-DEFAULT_SCRIPT = 'RESULT = (vae.decode(samples["samples"]), )'
+
+class AnyType(str):
+  """A special class that is always equal in not equal comparisons. Credit to pythongosssss"""
+
+  def __ne__(self, __value: object) -> bool:
+    return False
+
+
+any = AnyType("*")
+
+DEFAULT_SCRIPT = 'RESULT = (A, B, C, D)'
 
 class PythonScript:
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = (any,any,any,any,)
     FUNCTION = "run_script"
-
+    OUTPUT_NODE = True
     CATEGORY = "_for_testing"
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {}, "optional": {
-            "samples": ("LATENT", ),
-            "vae": ("VAE", ),
-            "clip": ("CLIP", ),
             "text": ("STRING", {"default": DEFAULT_SCRIPT, "multiline": True}),
-            "width": ("INT", {"default": 1280.0, "min": 0, "max": MAX_RESOLUTION}),
-            "height": ("INT", {"default": 768.0, "min": 0, "max": MAX_RESOLUTION}),
-            }}
+            "A": (any, {}),
+            "B": (any, {}),
+            "C": (any, {}),
+            "D": (any, {}),
+        }}
 
-    def run_script(self, samples=None, vae=None, clip=None, text=None, width=None, height=None):
+    def run_script(self, text=DEFAULT_SCRIPT, A=None, B=None, C=None, D=None):
         SCRIPT = text if text is not None and len(text) > 0 else DEFAULT_SCRIPT
         # print(SCRIPT)
         r = compile(SCRIPT, "<string>", "exec")
-        ctxt = {"RESULT": None, "samples": samples, "vae": vae, "clip": clip, "width": width, "height": height}
+        ctxt = {"RESULT": None, "A": A, "B": B, "C": C, "D": D}
         eval(r, ctxt)
         # print(ctxt["RESULT"])
         return ctxt["RESULT"]
@@ -543,18 +560,349 @@ class SetLatentCustomNoise:
 
 # Converts a latent to an image without decoding
 class LatentToImage:
+    RETURN_TYPES = ("IMAGE",)
+    CATEGORY = "latent"
+    FUNCTION = "latent_to_image"
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "samples": ("LATENT",), }}
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "latent_to_image"
-   
-    CATEGORY = "latent"
-   
-    def latent_to_image(self, samples):
-        return (samples["samples"],)
 
-class LatentNoiseStd:
+    def latent_to_image(self, samples):
+        samples = samples["samples"].clone()
+        image = samples.squeeze(0).unsqueeze(3).repeat(1,1,1,3)
+        return (image,)
+
+# Converts an image to a latent without encoding
+class ImageToLatent:
+    RETURN_TYPES = ("LATENT",)
+    CATEGORY = "latent"
+    FUNCTION = "image_to_latent"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+                "required": {
+                    "image": ("IMAGE",),
+                    "channel": (["red", "green", "blue", "alpha"],),
+                }
+        }
+
+    def image_to_latent(self, image, channel):
+        channels = ["red", "green", "blue", "alpha"]
+        channel_index = channels.index(channel)
+        if image.shape[0] == 4:
+            samples = image[:, :, :, channel_index].unsqueeze(0)
+        else:
+            samples = (image[0:1, :, :, channel_index].unsqueeze(1).repeat(1, 4, 1, 1))
+        return ({"samples": samples},)
+
+class LatentScaledNoise:
+    RETURN_TYPES = ("LATENT",)
+    CATEGORY = "latent/noise"
+    FUNCTION = "get_latent_noise_std"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+              "width": ("INT", {"default": 1024, "min": 8, "max": MAX_RESOLUTION, "step": 8}),
+              "height": ("INT", {"default": 1024, "min": 8, "max": MAX_RESOLUTION, "step": 8}),
+              "batch_size": ("INT", {"default": 1, "min": 1, "max": 64}),
+              "distribution": (["normal", "uniform"],),
+              "scale": ("FLOAT", {"default": 1.0, "step": 0.01}),
+              "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            }
+        }
+
+    def get_latent_noise_std(self, width, height, batch_size, distribution, scale, seed):
+        shape = [batch_size, 4, height // 8, width // 8]
+        generator = torch.manual_seed(seed)
+        if distribution == "normal":
+          noise = torch.randn(shape, generator=generator, device="cpu")
+        else:
+          noise = torch.rand(shape, generator=generator, device="cpu") * 2 - 1
+        return ({"samples":noise * scale},)
+
+class DisplayAnyType:
+  """Display any data node."""
+
+  NAME = 'Display Any'
+  CATEGORY = '_for_testing'
+
+  @classmethod
+  def INPUT_TYPES(cls):  # pylint: disable = invalid-name, missing-function-docstring
+    return {
+      "required": {
+        "source": (any, {}),
+      },
+    }
+
+  RETURN_TYPES = ()
+  FUNCTION = "main"
+  OUTPUT_NODE = True
+
+  def main(self, source=None):
+    value = 'None'
+    if source is not None:
+      try:
+        value = json.dumps(source)
+      except Exception:
+        try:
+          value = str(source)
+        except Exception:
+          value = 'source exists, but could not be serialized.'
+
+    return {"ui": {"text": (value,)}}
+
+class SamplerCustomCallback:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+                "required": {
+                  "model": ("MODEL",),
+                  "add_noise": ("BOOLEAN", {"default": True}),
+                  "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                  "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01}),
+                  "positive": ("CONDITIONING", ),
+                  "negative": ("CONDITIONING", ),
+                  "sampler": ("SAMPLER", ),
+                  "sigmas": ("SIGMAS", ),
+                  "latent_image": ("LATENT", ),
+                },
+                "optional": {
+                  "callback": ("CALLBACK", ),
+                  "state": ("STATE", ),
+                }
+               }
+
+    RETURN_TYPES = ("LATENT","LATENT","STATE")
+    RETURN_NAMES = ("denoised_output", "noise_output", "state")
+
+    FUNCTION = "sample"
+
+    CATEGORY = "sampling/custom_sampling"
+
+    def sample(self, model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image, callback=None, state=None):
+        sampler = copy.deepcopy(sampler)
+        latent = latent_image
+        latent_image = latent["samples"]
+        if "noise_custom" in latent:
+            noise = latent["noise_custom"]
+        elif not add_noise:
+            noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+        else:
+            batch_inds = latent["batch_index"] if "batch_index" in latent else None
+            noise = comfy.sample.prepare_noise(latent_image, noise_seed, batch_inds)
+
+        noise_mask = None
+        if "noise_mask" in latent:
+            noise_mask = latent["noise_mask"]
+        callback_function, callback_context = None, None
+        if callback is not None:
+            callback_function = callback["callback"]
+            callback_context = callback["ctxt"]
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        is_first_stage = state == None
+        is_last_stage = sigmas[-1] == 0
+        if state == None:
+            state = {}
+            # sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+            sigma_min =  0.02916753850877285003662109375000
+            sigma_max = 14.61464309692382812500000000000000
+            state["noise_sampler"] = BrownianTreeNoiseSampler(latent_image.to(model.load_device), sigma_min, sigma_max, seed=noise_seed, cpu="_gpu" not in sampler.sampler_function.__name__)
+            state["noise"] = noise.clone()
+
+        sampler.extra_options["state"] = state
+        sampler.extra_options["noise_sampler"] = state["noise_sampler"]
+        sampler.model_noise = state["noise"]
+        model = model.clone()
+        if not is_last_stage:
+            model.model_options["skip_process_latent_out"] = True
+        if not is_first_stage:
+            model.model_options["skip_process_latent_in"] = True
+        denoised_samples = comfy.sample.sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback_function, disable_pbar=disable_pbar, seed=noise_seed)
+
+        denoised_output = latent.copy()
+        denoised_output["samples"] = denoised_samples
+        if callback_context and "samples_noise" in callback_context and callback_context["samples_noise"] is not None:
+            noise_output = latent.copy()
+            noise_output["samples"] = model.model.process_latent_out(callback_context["samples_noise"].cpu())
+        else:
+            noise_output = None
+        return (denoised_output, noise_output, state)
+
+class KSAMPLER_nidefawl(Sampler):
+    def __init__(self, sampler_function, extra_options={}, inpaint_options={}):
+        self.sampler_function = sampler_function
+        self.extra_options = extra_options
+        self.inpaint_options = inpaint_options
+        self.model_noise = None
+
+    def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
+        extra_args["denoise_mask"] = denoise_mask
+        model_k = KSamplerX0Inpaint(model_wrap)
+        model_k.latent_image = latent_image
+        if self.model_noise is not None:
+            model_k.noise = self.model_noise
+        elif self.inpaint_options.get("random", False): #TODO: Should this be the default?
+            generator = torch.manual_seed(extra_args.get("seed", 41) + 1)
+            model_k.noise = torch.randn(noise.shape, generator=generator, device="cpu").to(noise.dtype).to(noise.device)
+        else:
+            model_k.noise = noise
+
+        if self.max_denoise(model_wrap, sigmas):
+            noise = noise * torch.sqrt(1.0 + sigmas[0] ** 2.0)
+        else:
+            noise = noise * sigmas[0]
+
+        k_callback = None
+        total_steps = len(sigmas) - 1
+        if callback is not None:
+            k_callback = lambda x: callback(x["i"], x["denoised"], x["x"], total_steps)
+
+        if latent_image is not None:
+            noise += latent_image
+
+        samples = self.sampler_function(model_k, noise, sigmas, extra_args=extra_args, callback=k_callback, disable=disable_pbar, **self.extra_options)
+        return samples
+
+class SamplerDPMPP_2M_SDE_nidefawl:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"solver_type": (['midpoint', 'heun'], ),
+                     "eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step":0.01, "round": False}),
+                     "s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step":0.01, "round": False}),
+                     "noise_device": (['gpu', 'cpu'], ),
+                      }
+               }
+    RETURN_TYPES = ("SAMPLER",)
+    CATEGORY = "sampling/custom_sampling/samplers"
+
+    FUNCTION = "get_sampler"
+
+    def get_sampler(self, solver_type, eta, s_noise, noise_device):
+        if noise_device == 'cpu':
+            sampler_name = "dpmpp_2m_sde"
+        else:
+            sampler_name = "dpmpp_2m_sde_gpu"
+        sampler_function = getattr(k_diffusion_sampling, "sample_{}".format(sampler_name))
+        sampler = comfy.samplers.KSAMPLER_nidefawl(sampler_function, {"eta": eta, "s_noise": s_noise, "solver_type": solver_type})
+        return (sampler, )
+
+class CustomCallback:
+    def __init__(self):
+        self.ctxt = {"pbar": None, "samples_noise": None}
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":{}}
+    FUNCTION = "get_callback"
+    CATEGORY = "sampling/custom_sampling"
+    RETURN_TYPES = ("CALLBACK",)
+   
+    def get_callback(self, **kwargs):
+      ctxt = self.ctxt
+      def callback(step, samples_denoised, samples_noise, total_steps):
+          if step == 0:
+              ctxt["pbar"] = comfy.utils.ProgressBar(total_steps)
+          ctxt["samples_noise"] = samples_noise
+          ctxt["pbar"].update_absolute(step + 1, total_steps, )
+      return ({"callback": callback, "ctxt": ctxt},)
+
+class SplitCustomSigmas:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+                  "required":
+                  {
+                      "sigmas": ("SIGMAS", ),
+                      "percent": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step":0.01, "round": False}),
+                  }
+               }
+    RETURN_TYPES = ("SIGMAS","SIGMAS")
+    CATEGORY = "sampling/custom_sampling/sigmas"
+
+    FUNCTION = "get_sigmas"
+
+    def get_sigmas(self, sigmas, percent):
+        split = int(sigmas.shape[0] * percent)
+        sigmas1 = sigmas[:min(split+1, sigmas.shape[0] - 1)]
+        sigmas2 = sigmas[split:]
+        return (sigmas1, sigmas2)
+    # Generate Perlin Power Fractal (Based on in-house perlin noise)
+
+# https://github.com/WASasquatch/was-node-suite-comfyui/blob/66b10d3aade22d3d6d5429e5ed7a7e8ee8e10930/WAS_Node_Suite.py#L1832
+def perlin_power_fractal(width, height, octaves, persistence, lacunarity, exponent, scale, seed=None):
+
+    @jit(nopython=True)
+    def fade(t):
+        return 6 * t**5 - 15 * t**4 + 10 * t**3
+
+    @jit(nopython=True)
+    def lerp(t, a, b):
+        return a + t * (b - a)
+
+    @jit(nopython=True)
+    def grad(hash, x, y, z):
+        h = hash & 15
+        u = x if h < 8 else y
+        v = y if h < 4 else (x if h == 12 or h == 14 else z)
+        return (u if (h & 1) == 0 else -u) + (v if (h & 2) == 0 else -v)
+
+    @jit(nopython=True)
+    def noise(x, y, z, p):
+        X = np.int32(np.floor(x)) & 255
+        Y = np.int32(np.floor(y)) & 255
+        Z = np.int32(np.floor(z)) & 255
+
+        x -= np.floor(x)
+        y -= np.floor(y)
+        z -= np.floor(z)
+
+        u = fade(x)
+        v = fade(y)
+        w = fade(z)
+
+        A = p[X] + Y
+        AA = p[A] + Z
+        AB = p[A + 1] + Z
+        B = p[X + 1] + Y
+        BA = p[B] + Z
+        BB = p[B + 1] + Z
+
+        return lerp(w, lerp(v, lerp(u, grad(p[AA], x, y, z), grad(p[BA], x - 1, y, z)),
+                                lerp(u, grad(p[AB], x, y - 1, z), grad(p[BB], x - 1, y - 1, z))),
+                    lerp(v, lerp(u, grad(p[AA + 1], x, y, z - 1), grad(p[BA + 1], x - 1, y, z - 1)),
+                                lerp(u, grad(p[AB + 1], x, y - 1, z - 1), grad(p[BB + 1], x - 1, y - 1, z - 1))))
+
+    if seed is not None:
+        random.seed(seed)
+
+    p = np.arange(256, dtype=np.int32)
+    random.shuffle(p)
+    p = np.concatenate((p, p))
+
+    noise_map = np.zeros((height, width))
+    amplitude = 1.0
+    total_amplitude = 0.0
+
+    for octave in range(octaves):
+        frequency = lacunarity ** octave
+        amplitude *= persistence
+        total_amplitude += amplitude
+
+        for y in range(height):
+            for x in range(width):
+                nx = x / scale * frequency
+                ny = y / scale * frequency
+                noise_value = noise(nx, ny, 0, p) * amplitude ** exponent
+                current_value = noise_map[y, x]
+                noise_map[y, x] = current_value + noise_value
+
+    return noise_map
+
+class LatentPerlinNoise:
     def __init__(self):
         pass
 
@@ -562,23 +910,32 @@ class LatentNoiseStd:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "samples": ("LATENT",),
-                "noise_std": ("FLOAT", {"default": 1.0}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            }
+                "width": ("INT", {"default": 512, "max": 8192, "min": 64, "step": 1}),
+                "height": ("INT", {"default": 512, "max": 8192, "min": 64, "step": 1}),
+                "scale": ("INT", {"default": 100, "max": 2048, "min": 2, "step": 1}),
+                "octaves": ("INT", {"default": 4, "max": 8, "min": 0, "step": 1}),
+                "persistence": ("FLOAT", {"default": 0.5, "max": 100.0, "min": 0.01, "step": 0.01}),
+                "lacunarity": ("FLOAT", {"default": 2.0, "max": 100.0, "min": 0.01, "step": 0.01}),
+                "exponent": ("FLOAT", {"default": 2.0, "max": 100.0, "min": 0.01, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),  
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
-    FUNCTION = "get_latent_noise_std"
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "perlin_power_fractal"
 
-    CATEGORY = "WAS Suite/Latent/Generate"
+    CATEGORY = "_for_testing"
 
-    def get_latent_noise_std(self, samples, noise_std, seed):
-        s = samples.copy()
-        torch.manual_seed(seed)
-        noise = torch.randn_like(s["samples"]) * noise_std
-        s["samples"] = s["samples"] + noise
-        return (s,)
+    def perlin_power_fractal(self, width, height, scale, octaves, persistence, lacunarity, exponent, seed):
+        latent = torch.zeros([1, 4, height // 8, width // 8])
+        for i in range(latent.shape[1]):
+            noise_map = perlin_power_fractal(width // 8, height // 8, octaves, persistence, lacunarity, exponent, scale, seed + i)
+            latent[0, i, :, :] = torch.from_numpy(noise_map).to(torch.float32)
+        latent -= latent.min()
+        latent /= latent.max()
+        latent = latent * 2.0 - 1.0
+        return ({"samples": latent},)
 
 NODE_CLASS_MAPPINGS = {
     "PythonScript": PythonScript,
@@ -591,4 +948,13 @@ NODE_CLASS_MAPPINGS = {
     "EmptyImageWithColor": EmptyImageWithColor,
     "MaskFromColor": MaskFromColor,
     "SetLatentCustomNoise": SetLatentCustomNoise,
+    "LatentToImage": LatentToImage,
+    "ImageToLatent": ImageToLatent,
+    "LatentScaledNoise": LatentScaledNoise,
+    "DisplayAnyType": DisplayAnyType,
+    "SamplerCustomCallback": SamplerCustomCallback,
+    "CustomCallback": CustomCallback,
+    "SplitCustomSigmas": SplitCustomSigmas,
+    "SamplerDPMPP_2M_SDE_nidefawl": SamplerDPMPP_2M_SDE_nidefawl,
+    "LatentPerlinNoise": LatentPerlinNoise,
 }
