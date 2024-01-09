@@ -422,20 +422,20 @@ class gcLatentTunnel:
     def INPUT_TYPES(s):
       return {
         "required": {
-			  "samples": ("LATENT",),
+			  "input": (any,),
 		  }
 	  }
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = (any,)
+    RETURN_NAMES = ("output",)
     FUNCTION = "gcTunnel"
-    CATEGORY = "latent"
+    CATEGORY = "_for_testing"
 
-    def gcTunnel(self, samples):
+    def gcTunnel(self, input):
         print("Garbage collecting...")
-        s = samples.copy()
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-        return (s,)
+        return (input,)
 
 
 # https://github.com/comfyanonymous/ComfyUI_experiments
