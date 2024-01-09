@@ -684,8 +684,9 @@ class SamplerCustomCallback:
     CATEGORY = "sampling/custom_sampling"
 
     def sample(self, model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image, callback=None, state=None):
-        sampler = copy.deepcopy(sampler)
         latent = latent_image
+        if sigmas is None or len(sigmas) == 0:
+            return (latent_image, None, None)
         latent_image = latent["samples"]
         if "noise_custom" in latent:
             noise = latent["noise_custom"]
@@ -713,6 +714,7 @@ class SamplerCustomCallback:
             state["noise_sampler"] = BrownianTreeNoiseSampler(latent_image.to(model.load_device), sigma_min, sigma_max, seed=noise_seed, cpu="_gpu" not in sampler.sampler_function.__name__)
             state["noise"] = noise.clone()
 
+        sampler = copy.deepcopy(sampler)
         sampler.extra_options["state"] = state
         sampler.extra_options["noise_sampler"] = state["noise_sampler"]
         sampler.model_noise = state["noise"]
@@ -788,7 +790,7 @@ class SamplerDPMPP_2M_SDE_nidefawl:
         else:
             sampler_name = "dpmpp_2m_sde_gpu"
         sampler_function = getattr(k_diffusion_sampling, "sample_{}".format(sampler_name))
-        sampler = comfy.samplers.KSAMPLER_nidefawl(sampler_function, {"eta": eta, "s_noise": s_noise, "solver_type": solver_type})
+        sampler = KSAMPLER_nidefawl(sampler_function, {"eta": eta, "s_noise": s_noise, "solver_type": solver_type})
         return (sampler, )
 
 class CustomCallback:
@@ -827,7 +829,7 @@ class SplitCustomSigmas:
 
     def get_sigmas(self, sigmas, percent):
         split = int(sigmas.shape[0] * percent)
-        sigmas1 = sigmas[:min(split+1, sigmas.shape[0] - 1)]
+        sigmas1 = sigmas[:min(split+1, sigmas.shape[0])]
         sigmas2 = sigmas[split:]
         return (sigmas1, sigmas2)
     # Generate Perlin Power Fractal (Based on in-house perlin noise)
