@@ -714,16 +714,25 @@ class SamplerCustomCallback:
             state["noise_sampler"] = BrownianTreeNoiseSampler(latent_image.to(model.load_device), sigma_min, sigma_max, seed=noise_seed, cpu="_gpu" not in sampler.sampler_function.__name__)
             state["noise"] = noise.clone()
 
-        sampler = copy.deepcopy(sampler)
         sampler.extra_options["state"] = state
         sampler.extra_options["noise_sampler"] = state["noise_sampler"]
         sampler.model_noise = state["noise"]
-        model = model.clone()
+
         if not is_last_stage:
             model.model_options["skip_process_latent_out"] = True
         if not is_first_stage:
             model.model_options["skip_process_latent_in"] = True
-        denoised_samples = comfy.sample.sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback_function, disable_pbar=disable_pbar, seed=noise_seed)
+
+        try:
+            denoised_samples = comfy.sample.sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback_function, disable_pbar=disable_pbar, seed=noise_seed)
+        finally:
+            if 'skip_process_latent_out' in model.model_options:
+                del model.model_options["skip_process_latent_out"]
+            if 'skip_process_latent_in' in model.model_options:
+                del model.model_options["skip_process_latent_in"]
+            del sampler.extra_options["state"]
+            del sampler.extra_options["noise_sampler"]
+            del sampler.model_noise
 
         denoised_output = latent.copy()
         denoised_output["samples"] = denoised_samples
